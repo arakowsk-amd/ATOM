@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -23,28 +23,29 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-from torch.profiler import record_function
-
-from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
 )
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation.sim.sizing import sim_block_bytes
 from atom.model_engine.run_labels import build_run_label
-from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.model_loader.loader import load_model
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
-from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from torch.profiler import record_function
+
+from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_loader.loader import load_model
+from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -136,8 +137,8 @@ class tokenIDProcessor:
         gpu_tensor: torch.Tensor,
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
-        copy_done: Optional[torch.cuda.Event] = None,
-        gpu_logprobs: Optional[torch.Tensor] = None,
+        copy_done: torch.cuda.Event | None = None,
+        gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
@@ -159,7 +160,7 @@ class tokenIDProcessor:
         event.synchronize()
         return cpu_tensor
 
-    def recv_logprobs(self) -> Optional[list[float]]:
+    def recv_logprobs(self) -> list[float] | None:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output (which synchronizes the event).
         """
@@ -212,7 +213,7 @@ class tokenIDProcessor:
 
     def recv_mtp_status_async(
         self,
-    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
         if not self.pending_mtp_status_copies:
             return None, None
         cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
@@ -223,13 +224,13 @@ class tokenIDProcessor:
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
-        self.logprobs_cpu: list[Optional[torch.Tensor]] = []
+        self.logprobs_cpu: list[torch.Tensor | None] = []
 
-        self.prev_batch: Optional[ScheduledBatch] = None
-        self.prev_token_ids: Optional[torch.Tensor] = None
+        self.prev_batch: ScheduledBatch | None = None
+        self.prev_token_ids: torch.Tensor | None = None
 
         self.pre_num_decode_token_per_seq = 1
-        self.draft_token_ids: Optional[torch.Tensor] = None
+        self.draft_token_ids: torch.Tensor | None = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
         # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
         # D2H copies fired by send_mtp_status_to_cpu_async, drained by
@@ -266,8 +267,8 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-        sampled_logprobs: Optional[torch.Tensor] = None,
-    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, float]]]:
+        sampled_logprobs: torch.Tensor | None = None,
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -665,6 +666,12 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        # Simulator compute-skip flag: True when config.simulator is set.  In
+        # simulator mode the runner fabricates KV/logits instead of running the
+        # model, so it never consumes GPU compute even when a GPU is present and
+        # visible.  Decoupled from torch.cuda.is_available() on purpose — the
+        # producer must run compute-free on a real GPU node (Part B P/D).
+        self._sim_skip_compute: bool = getattr(config, "simulator", False)
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -704,7 +711,10 @@ class ModelRunner:
             self.profiler_dir = os.path.join(config.torch_profiler_dir, self.rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
-        self._setup_device_and_distributed(rank, config)
+        if self._sim_skip_compute:
+            self._setup_device_and_distributed_sim()
+        else:
+            self._setup_device_and_distributed(rank, config)
 
         self.graph_bs = [0]  # for eager fallback
         # PIECEWISE cudagraph state, populated by capture_cudagraph. Empty when
@@ -715,6 +725,35 @@ class ModelRunner:
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
+
+        # ------------------------------------------------------------------
+        # Simulator compute-skip: skip model loading, attn backend, warmup, etc.
+        # ------------------------------------------------------------------
+        if self._sim_skip_compute:
+            self.attn_backend = None
+            self.attn_metadata_builder = None
+            self.physical_block_size = self.block_size
+            self.num_spec_tokens = 0
+            self.eagle3_mode = False
+            self.use_aux_hidden_state_outputs = False
+            self.use_dspark_aux_capture = False
+            self._aux_hidden_states = None
+            self.sampler = Sampler()
+            self.arange_np = np.arange(
+                max(
+                    self.config.max_num_seqs + 1,
+                    self.config.max_model_len,
+                    self.config.max_num_batched_tokens,
+                ),
+                dtype=np.int64,
+            )
+            self.still_running = True
+            logger.info(
+                "Simulator compute-skip mode: skipping model load, attn backend, "
+                "warmup, and CUDA graph capture (GPU, if present, stays unused)"
+            )
+            return
+
         torch.set_default_device(self.device)
         self.attn_backend = get_attn_backend(
             self.block_size,
@@ -800,7 +839,7 @@ class ModelRunner:
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
-            known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
+            known = _IOProc._per_req_cache_model_types()
             assert mt in known, (
                 f"Attention builder {type(self.attn_metadata_builder).__name__} "
                 f"reports per_req_cache_bytes>0 but model_type={mt!r} is not in "
@@ -976,10 +1015,23 @@ class ModelRunner:
             ),
         )
 
+    def _setup_device_and_distributed_sim(self):
+        """Simulator compute-skip stub for device/distributed setup.
+
+        Sets ``self.device`` to CPU and ``self.world_size`` to 1.  No NCCL
+        init, no ``torch.cuda.set_device`` — the simulator never touches the
+        GPU even when one is present, so CPU tensors suffice.
+        """
+        self.device = torch.device("cpu")
+        self.world_size = 1
+        logger.info(
+            "Simulator compute-skip: device=cpu, world_size=1 (no distributed init)"
+        )
+
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
-        cumsum_dtype: Optional[np.dtype] = None,
+        cumsum_dtype: np.dtype | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Get the cumulative sum and batched arange of the given array.
         # E.g., [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
@@ -1000,6 +1052,8 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        if self._sim_skip_compute:
+            return True
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -1025,7 +1079,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
         return True
 
-    def start_profiler(self, trace_name: Optional[str] = None):
+    def start_profiler(self, trace_name: str | None = None):
         """
         Start profiling for this rank.
 
@@ -1332,6 +1386,13 @@ class ModelRunner:
         Eagle3 independent MHA). Per-request cache bytes are accounted
         for separately via `compute_per_req_cache_bytes()`.
         """
+        if self._sim_skip_compute:
+            return sim_block_bytes(
+                self.config.hf_config,
+                self.block_size,
+                kv_dtype=self.kv_cache_dtype,
+                tp_size=self.config.tensor_parallel_size,
+            )
         block_bytes = self.attn_metadata_builder.compute_block_bytes()
         if hasattr(self, "eagle3_draft_builder"):
             block_bytes += self.eagle3_draft_builder.compute_block_bytes()
@@ -1429,6 +1490,8 @@ class ModelRunner:
         return int(overhead)
 
     def get_num_blocks(self) -> dict[str, int]:
+        if self._sim_skip_compute:
+            return self._get_num_blocks_sim()
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1677,7 +1740,52 @@ class ModelRunner:
             "swa_window_size": int(getattr(config, "swa_window_size", 0)),
         }
 
+    def _get_num_blocks_sim(self) -> dict[str, int]:
+        """Compute-free block count derivation for simulator mode.
+
+        The simulator allocates metadata-only KV cache, so free-VRAM has no
+        bearing on the block budget.  Instead of querying
+        ``torch.cuda.mem_get_info``, derive num_blocks from the configured
+        ``sim_isl`` (input sequence length) and ``sim_concurrency`` with a
+        safety factor so the block manager never runs out during simulated
+        prefill.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+
+        block_bytes = self._compute_block_bytes()
+        sim_isl = getattr(config, "sim_isl", config.max_model_len)
+        sim_concurrency = getattr(config, "sim_concurrency", config.max_num_seqs)
+        blocks_per_req = math.ceil(sim_isl / self.block_size)
+        # 2x safety factor so the pool is never the bottleneck.
+        num_kvcache_blocks = blocks_per_req * sim_concurrency * 2
+        config.num_swa_blocks = 0
+        config.swa_window_size = 0
+        config.per_req_cache_equiv_blocks = 0
+        config.num_per_req_cache_groups = 0
+        logger.info(
+            "Simulator get_num_blocks (compute-free): sim_isl=%d, "
+            "sim_concurrency=%d, blocks_per_req=%d, "
+            "num_kvcache_blocks=%d, block_bytes=%d",
+            sim_isl,
+            sim_concurrency,
+            blocks_per_req,
+            num_kvcache_blocks,
+            block_bytes,
+        )
+        return {
+            "num_kvcache_blocks": num_kvcache_blocks,
+            "per_req_cache_equiv_blocks": 0,
+            "num_per_req_cache_groups": 0,
+            "num_swa_blocks": 0,
+            "swa_window_size": 0,
+        }
+
     def allocate_kv_cache(self, num_kvcache_blocks):
+        if self._sim_skip_compute:
+            return self._allocate_kv_cache_sim(num_kvcache_blocks)
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
@@ -1887,7 +1995,38 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
-    def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
+    def _allocate_kv_cache_sim(self, num_kvcache_blocks) -> bool:
+        """Compute-free simulator KV cache allocation.
+
+        Stores metadata-only dicts instead of real CUDA tensors so the
+        scheduler / block-manager can track block assignments without touching
+        GPU memory.
+        """
+        config = self.config
+        config.num_kvcache_blocks = num_kvcache_blocks
+        hf_config = config.hf_config
+        self.num_physical_kvcache_blocks = num_kvcache_blocks
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            num_kv_heads = 1
+        self.num_kv_heads = num_kv_heads
+        self.aligned_index_dim = None
+        self.max_per_req_cache_slots = 0
+        self.num_swa_blocks = 0
+
+        # Metadata-only KV cache placeholder — no real tensors.
+        num_layers = hf_config.num_hidden_layers
+        kv_cache_data = {f"layer_{i}": None for i in range(num_layers)}
+        set_kv_cache_data(kv_cache_data, config, None, num_blocks=num_kvcache_blocks)
+        logger.info(
+            "Simulator: allocated metadata-only KV cache " "(%d blocks, %d layers)",
+            num_kvcache_blocks,
+            num_layers,
+        )
+        return True
+
+    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size
         dp_rank = self.config.parallel_config.data_parallel_rank
 
@@ -1947,8 +2086,8 @@ class ModelRunner:
     def _preprocess(
         self,
         batch: ScheduledBatch,
-        num_scheduled_tokens: Optional[np.ndarray] = None,
-        dspark_shape: Optional[tuple[int, int, int]] = None,
+        num_scheduled_tokens: np.ndarray | None = None,
+        dspark_shape: tuple[int, int, int] | None = None,
     ):
         """Per-step DP sync: token padding, prefill fan-out, TBO decision.
 
@@ -2359,7 +2498,7 @@ class ModelRunner:
         self,
         batch: ScheduledBatch,
         input_ids: torch.Tensor = None,
-        preprocessed: Optional[tuple] = None,
+        preprocessed: tuple | None = None,
     ):
         # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
         # prepare_input_ids, so the batch is already reduced when we get here.
@@ -2601,7 +2740,7 @@ class ModelRunner:
         )
 
     @staticmethod
-    def _detailed_label_suffix(batch: Optional[ScheduledBatch]) -> str:
+    def _detailed_label_suffix(batch: ScheduledBatch | None) -> str:
         """Detailed attention aggregates for the trace label, or ``""``.
 
         These fields are only populated by
@@ -2734,8 +2873,10 @@ class ModelRunner:
     def run_model(
         self,
         input_ids: torch.Tensor,
-        batch: Optional[ScheduledBatch] = None,
+        batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._sim_skip_compute:
+            return self._run_model_sim(input_ids)
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.batch_size
@@ -2905,6 +3046,25 @@ class ModelRunner:
 
         return logits, hidden_states
 
+    def _run_model_sim(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute-free simulator forward stub.
+
+        Returns zeroed logits ``[num_tokens, vocab_size]`` and hidden_states
+        ``[num_tokens, hidden_size]`` WITHOUT calling ``self.model(...)`` so
+        the sampler still emits a token (argmax of zeros = token 0).
+        """
+        num_tokens = input_ids.shape[0]
+        hf_config = self.config.hf_config
+        hidden_size = hf_config.hidden_size
+        vocab_size = hf_config.vocab_size
+        logits = torch.zeros(num_tokens, vocab_size, dtype=torch.float32)
+        hidden_states = torch.zeros(
+            num_tokens, hidden_size, dtype=self.config.torch_dtype
+        )
+        return logits, hidden_states
+
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -2987,7 +3147,7 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
-        draft_token_ids: Optional[np.ndarray] = None
+        draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
@@ -3045,6 +3205,8 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if self._sim_skip_compute:
+            return self._forward_sim(batch)
         (
             input_ids,
             temperatures,
@@ -3069,6 +3231,34 @@ class ModelRunner:
         reset_forward_context()
 
         return fwd_output
+
+    def _forward_sim(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        """Compute-free forward for the simulator producer.
+
+        Emits one dummy first token (id 0) per scheduled sequence WITHOUT
+        touching the model, attention backend, KV tensors, or the GPU.  The
+        scheduler applies these tokens through its normal non-deferred path
+        (``Scheduler.update_from_output``): partial-prefill sequences are
+        filtered out by ``seq.is_partial_prefill`` there, and a fully
+        prefilled producer sequence finishes after its first token, which
+        fires ``kv_connector.request_finished`` — the producer handshake.
+
+        Token *content* is irrelevant for a KV producer: the handshake carries
+        block ids, not KV bytes, and decode perf is content-independent.
+        """
+        req_ids = list(batch.req_ids)
+        bs = len(req_ids)
+        token_ids: list[tuple[int, ...]] = [(0,)] * bs
+        return ScheduledBatchOutput(
+            req_ids=req_ids,
+            token_ids=token_ids,
+            num_rejected=np.zeros(bs, dtype=np.int32),
+            num_bonus=np.zeros(bs, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=False,
+            logprobs=None,
+            dspark_ell=None,
+        )
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
@@ -3470,6 +3660,9 @@ class ModelRunner:
         return False
 
     def capture_cudagraph(self):
+        if self._sim_skip_compute:
+            logger.info("Simulator compute-skip: skipping CUDA graph capture")
+            return 0, [], 0
         _piecewise = self._piecewise_cg_active()
         if _piecewise:
             logger.info(

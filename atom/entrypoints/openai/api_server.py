@@ -1794,6 +1794,12 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
 
+    # --- Simulator workload hook ---
+    if engine.config.simulator:
+        from atom.workload.sim_workload import start_sim_workload
+
+        start_sim_workload(engine, engine.config, engine_args)
+
     import signal
 
     def _sigint_handler(signum, frame):
