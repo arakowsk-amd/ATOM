@@ -135,6 +135,14 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeConnectorScheduler",
 )
 
+KVConnectorFactory.register(
+    "sim",
+    worker_module="atom.kv_transfer.disaggregation.sim.sim_connector",
+    worker_class="SimConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.sim.sim_connector",
+    scheduler_class="SimConnectorScheduler",
+)
+
 # Composite backend: fans out to several sub-connectors listed under
 # kv_transfer_config["connectors"] (e.g. moriio P/D + lmcache_offload on one
 # prefill node). Lightweight import — no heavy deps until a sub is built.
