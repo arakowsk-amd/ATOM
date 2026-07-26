@@ -2,10 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import logging
 import json
+import logging
 from dataclasses import dataclass, fields
-from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
@@ -13,7 +12,7 @@ from atom.config import CompilationConfig, CUDAGraphMode, SpeculativeConfig
 logger = logging.getLogger("atom")
 
 
-def parse_size_list(size_str: str) -> List[int]:
+def parse_size_list(size_str: str) -> list[int]:
     """Parse a string representation of a list into a Python list."""
     import ast
 
@@ -36,9 +35,9 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
-    index_cache_dtype: Optional[str] = None
+    index_cache_dtype: str | None = None
     block_size: int = 16
-    max_model_len: Optional[int] = None
+    max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
@@ -49,19 +48,28 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
-    torch_profiler_dir: Optional[str] = None
+    torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     enable_tbo: Optional[str] = None
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
-    draft_model: Optional[str] = None
+    draft_model: str | None = None
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
     hf_overrides: Optional[dict] = None
+
+    # Simulator (prefill/decode sim-producer) options
+    simulator: bool = False
+    sim_isl: int = 2048
+    sim_concurrency: int = 8
+    sim_model: Optional[str] = None
+    sim_rate: Optional[float] = None
+    sim_prefill_tp: Optional[int] = None
+    sim_prefill_dp: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
@@ -328,6 +336,55 @@ class EngineArgs:
             ),
         )
 
+        # ---- Simulator (prefill/decode sim-producer) options ----
+        sim_group = parser.add_argument_group("Simulator options")
+        sim_group.add_argument(
+            "--simulator",
+            action="store_true",
+            help="Enable simulator mode (compute-free prefill/decode producer; "
+            "runs without using GPU compute even when a GPU is present). "
+            "Forces load_dummy=True and enforce_eager=True.",
+        )
+        sim_group.add_argument(
+            "--sim-isl",
+            type=int,
+            default=2048,
+            help="Simulated input sequence length (tokens). Default: 2048.",
+        )
+        sim_group.add_argument(
+            "--sim-concurrency",
+            type=int,
+            default=8,
+            help="Number of concurrent simulated requests. Default: 8.",
+        )
+        sim_group.add_argument(
+            "--sim-model",
+            type=str,
+            default=None,
+            help="Model name advertised by the simulator (overrides --model "
+            "for handshake metadata only).",
+        )
+        sim_group.add_argument(
+            "--sim-rate",
+            type=float,
+            default=None,
+            help="Target request rate (requests/sec). None = closed-loop.",
+        )
+        sim_group.add_argument(
+            "--sim-prefill-tp",
+            type=int,
+            default=None,
+            help="Advertised tensor-parallel size for handshake metadata "
+            "(logical topology, not physical process count).",
+        )
+        sim_group.add_argument(
+            "--sim-prefill-dp",
+            type=int,
+            default=None,
+            help="Advertised data-parallel size for handshake metadata "
+            "(logical topology, not physical process count).",
+        )
+
         return parser
 
     @classmethod
@@ -389,6 +446,25 @@ class EngineArgs:
 
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
+
+        # --- Simulator mode forcing ---
+        # Pop sim-specific fields (EngineArgs-only, not Config fields).
+        sim_isl = kwargs.pop("sim_isl", None)  # noqa: F841
+        sim_concurrency = kwargs.pop("sim_concurrency", None)  # noqa: F841
+        sim_model = kwargs.pop("sim_model", None)  # noqa: F841
+        sim_rate = kwargs.pop("sim_rate", None)  # noqa: F841
+        sim_prefill_tp = kwargs.pop("sim_prefill_tp", None)  # noqa: F841
+        sim_prefill_dp = kwargs.pop("sim_prefill_dp", None)  # noqa: F841
+
+        if kwargs.get("simulator"):
+            kwargs["load_dummy"] = kwargs.get("load_dummy") or "empty"
+            kwargs["enforce_eager"] = True
+            # Inject sim-producer kv_transfer_config unless user already set one.
+            user_kv_cfg = kwargs.get("kv_transfer_config", "{}")
+            if user_kv_cfg in ("{}", "", None):
+                kwargs["kv_transfer_config"] = json.dumps(
+                    {"kv_connector": "sim", "kv_role": "kv_producer"}
+                )
 
         logger.info(f"Engine kwargs: {kwargs}")
 

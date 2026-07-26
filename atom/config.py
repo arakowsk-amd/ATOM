@@ -1059,6 +1059,7 @@ class Config:
     asyncio_mode: bool = False
     mark_trace: bool = False
     load_dummy: Optional[str] = None
+    simulator: bool = False
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
