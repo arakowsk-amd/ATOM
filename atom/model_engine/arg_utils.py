@@ -52,24 +52,24 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
-    enable_tbo: Optional[str] = None
-    all2all_backend: Optional[str] = None
-    method: Optional[str] = None
+    enable_tbo: str | None = None
+    all2all_backend: str | None = None
+    method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
     mark_trace: bool = False
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict] = None
+    online_quant_config: dict | None = None
+    hf_overrides: dict | None = None
 
     # Simulator (prefill/decode sim-producer) options
     simulator: bool = False
     sim_isl: int = 2048
     sim_concurrency: int = 8
-    sim_model: Optional[str] = None
-    sim_rate: Optional[float] = None
-    sim_prefill_tp: Optional[int] = None
-    sim_prefill_dp: Optional[int] = None
+    sim_model: str | None = None
+    sim_rate: float | None = None
+    sim_prefill_tp: int | None = None
+    sim_prefill_dp: int | None = None
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
