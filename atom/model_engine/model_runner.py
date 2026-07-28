@@ -1763,22 +1763,40 @@ class ModelRunner:
         num_kvcache_blocks = blocks_per_req * sim_concurrency * 2
         config.num_swa_blocks = 0
         config.swa_window_size = 0
+
+        # Per-request cache (GDN recurrent state / DeepSeek-V4 compressor +
+        # index state). Stateful-attention model_types need a non-empty
+        # per-req cache free-list or the scheduler treats effective
+        # max_num_seqs as 0 and NO request is ever scheduled. The backing
+        # tensor is skipped in sim mode (metadata-only KV cache, compute is
+        # stubbed), so only the BlockManager free-list bookkeeping matters:
+        # size it to max_num_seqs to match the real path's group count.
+        # per_req_cache_equiv_blocks stays 0 — the metadata-only pool is not
+        # memory-charged.
+        from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
+
+        needs_per_req_cache = (
+            config.hf_config.model_type in _IOProc._per_req_cache_model_types()
+        )
+        num_per_req_cache_groups = config.max_num_seqs if needs_per_req_cache else 0
         config.per_req_cache_equiv_blocks = 0
-        config.num_per_req_cache_groups = 0
+        config.num_per_req_cache_groups = num_per_req_cache_groups
         logger.info(
             "Simulator get_num_blocks (compute-free): sim_isl=%d, "
             "sim_concurrency=%d, blocks_per_req=%d, "
-            "num_kvcache_blocks=%d, block_bytes=%d",
+            "num_kvcache_blocks=%d, block_bytes=%d, "
+            "num_per_req_cache_groups=%d",
             sim_isl,
             sim_concurrency,
             blocks_per_req,
             num_kvcache_blocks,
             block_bytes,
+            num_per_req_cache_groups,
         )
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
             "per_req_cache_equiv_blocks": 0,
-            "num_per_req_cache_groups": 0,
+            "num_per_req_cache_groups": num_per_req_cache_groups,
             "num_swa_blocks": 0,
             "swa_window_size": 0,
         }
